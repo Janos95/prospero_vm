@@ -22,7 +22,7 @@ For small tiles, we use a simple batched evaluator that processes all pixels in 
 
 The divide and conquer process is multi-threaded using OpenMP.
 
-### Failed Optimizations
+### Failed Optimizations Attempts
 
 I experimented with several other optimization techniques that didn't provide significant performance improvements:
 
@@ -30,8 +30,16 @@ I attempted to explicitly use SIMD instructions for both the batch evaluator and
 did not yield better performance. Apparently, the loops are already SIMD-friendly enough for the compiler to 
 automatically vectorize them.
 
-I also explored various approaches to reduce memory allocations. They didn't provide measurable performance 
-improvements though. I guess the system allocator is smarter than what I could come up with :)
+I also explored various approaches to reduce memory allocations and overall memory footpring. 
+They didn't provide measurable performance improvements though. I guess the system allocator 
+is smarter than what I could come up with :)
 
-Currently, the main bottleneck is interval evaluation, particularly expression simplification, which requires 
-two passes through the instruction list.
+I also investigated a completely different approach: If you look at the expression long enough, you notice that it is 
+basically a big union of about 700 fairly simple expressions (on average about 20 instructions), i.e. it has 
+the form min(e1, ... , e_700). 
+If you visualize the expressions, they are all primitives localized in various regions of the image. 
+So it seems natural to parse out all these subexpressions, find a conservative bounding box for each of 
+them and then in parallel rasterize each expression into the final image.
+Unfortunately, it turns out that extracing the individual expressions from their joint instruction list is already
+fairly slow. At least my somewhat optimized implementation took more than a millisecond to create the 
+700 instruction lists.
