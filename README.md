@@ -2,6 +2,8 @@
 
 A small, self-contained C++ implementation of Matt Keeter's [Prospero Challenge](https://www.mattkeeter.com/projects/prospero/). 
 
+![4K Render](out_4k.ppm)
+
 ## Performance
 
 On a MacBook Air (M2), it renders the 1024x1024 image in about **2ms**. Running `make run` produces:
@@ -13,7 +15,7 @@ Allocating image took 0.35 ms
 Rendered 500x at 1.96ms/frame
 ```
 
-A 4096×4096 takes about **4ms** for the expression evaluation. This was somewhat surprising to me, but 
+A 4096×4096 render takes about **4ms** for the expression evaluation. This was somewhat surprising to me, but 
 I think it can be explained by a combination of factors. For example for a 1024x1024 image the leaf tiles
 are too small to be contained inside of the shape, so we have to explicitly evaluate all leaf tiles. 
 Also the multi-threading seems to be slightly more effective at the larger size.
