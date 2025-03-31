@@ -1,6 +1,6 @@
 # Prospero Virtual Machine
 
-A small, self-contained C++ implementation of Matt Keeter's [Prospero Challenge](https://www.mattkeeter.com/projects/prospero/). 
+A small (<600 loc), self-contained C++ implementation of Matt Keeter's [Prospero Challenge](https://www.mattkeeter.com/projects/prospero/). 
 
 <img src="out_4k.png" alt="4K Render" width="400">
 
