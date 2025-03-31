@@ -567,7 +567,7 @@ int main(int argc, char *argv[])
 
     printf("Generating image with %d threads...\n", num_threads.load());
 
-    constexpr int num_runs = 50;
+    constexpr int num_runs = 500;
 
     std::chrono::duration<double, std::milli> render_time{};
     std::vector<float> image(IMAGE_SIZE * IMAGE_SIZE, 0.0f);

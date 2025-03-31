@@ -1,5 +1,5 @@
 CXX = clang++
-CXXFLAGS = -O3 -ffast-math -Xclang -fopenmp -lomp -std=c++17 -L/opt/homebrew/opt/libomp/lib
+CXXFLAGS = -O3 -Xclang -fopenmp -lomp -std=c++17 -L/opt/homebrew/opt/libomp/lib
 TARGET = vm
 SRCS = vm.cpp
 
