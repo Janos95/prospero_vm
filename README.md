@@ -2,7 +2,7 @@
 
 A small, self-contained C++ implementation of Matt Keeter's [Prospero Challenge](https://www.mattkeeter.com/projects/prospero/). 
 
-![4K Render](out_4k.png)
+<img src="out_4k.png" alt="4K Render" width="800">
 
 ## Performance
 
