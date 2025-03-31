@@ -1,16 +1,28 @@
-# Prospero Challenge Implementation
+# Prospero Virtual Machine
 
 A small, self-contained C++ implementation of Matt Keeter's [Prospero Challenge](https://www.mattkeeter.com/projects/prospero/). 
 
 ## Performance
 
-On a MacBook Air (M2), it renders the 1024x1024 image in about 2ms. Running `make run` yields:
+On a MacBook Air (M2), it renders the 1024x1024 image in about 2ms. Running `make run` produces:
 
 ```
-Loaded instructions in 2.36 ms
-Generating image with 8 threads...
-Rendered 500x at 1.945671ms/frame
+Loaded instructions in 1.67 ms
+Allocating tls for 8 threads took 2.97 ms
+Allocating image took 0.35 ms
+Rendered 500x at 1.96ms/frame
 ```
+
+For a 4096×4096 render, we get
+
+```
+Loaded instructions in 1.66 ms
+Allocating tls for 8 threads took 2.85 ms
+Allocating image took 5.55 ms
+Rendered 500x at 4.30ms/frame
+```
+
+The single threaded performance comes in at about 8.69ms/frame for an image of size1024x1024 and 20.98ms for a 4k image.
 
 ## Implementation Details
 

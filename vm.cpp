@@ -552,8 +552,7 @@ int main(int argc, char *argv[])
     printf("Loaded instructions in %.2f ms\n", duration_load.count());
 
     std::atomic_int num_threads = 0;
-
-    // setup thread local data
+    auto start_setup = std::chrono::high_resolution_clock::now();
     #pragma omp parallel
     {
         thread_batch_vars.resize(instructions.size());
@@ -561,13 +560,18 @@ int main(int argc, char *argv[])
         thread_remap4.resize(instructions.size());
         ++num_threads;
     }
+    auto end_setup = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration_setup = end_setup - start_setup;
+    printf("Allocating tls for %d threads took %.2f ms\n", num_threads.load(), duration_setup.count());
 
-    printf("Generating image with %d threads...\n", num_threads.load());
+    auto start_alloc = std::chrono::high_resolution_clock::now();
+    std::vector<float> image(IMAGE_SIZE * IMAGE_SIZE, 0.0f);
+    auto end_alloc = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration_alloc = end_alloc - start_alloc;
+    printf("Allocating image took %.2f ms\n", duration_alloc.count());
 
     constexpr int num_runs = 500;
-
     std::chrono::duration<double, std::milli> render_time{};
-    std::vector<float> image(IMAGE_SIZE * IMAGE_SIZE, 0.0f);
     for(size_t i = 0; i < num_runs; i++) 
     {
         auto start = std::chrono::high_resolution_clock::now();
@@ -576,7 +580,7 @@ int main(int argc, char *argv[])
         render_time += end - start;
     }
 
-    printf("Rendered %dx at %.6fms/frame\n", num_runs, render_time.count() / num_runs);
+    printf("Rendered %dx at %.2fms/frame\n", num_runs, render_time.count() / num_runs);
     write_image(image, "out.ppm");
     return 0;
 }
