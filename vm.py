@@ -1,3 +1,5 @@
+# Reference python implementation by Matt Keeter
+
 import numpy as np
 
 with open('parts/prospero.vm') as f:

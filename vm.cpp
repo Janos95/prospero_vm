@@ -324,19 +324,16 @@ Interval4 evaluate_interval4(const std::vector<Instruction>& instructions, const
 }
 
 void prune_instructions4(const std::vector<Instruction>& original_instructions, std::array<std::vector<Instruction>, 4>& compacted_instructions) {
-    Interval4* interval_vars = thread_interval4_vars.data(); // get thread local data
-    std::array<int, 4>* remap = thread_remap4.data(); // get thread local data
+    // Get thread local data
+    Interval4* interval_vars = thread_interval4_vars.data();
+    std::array<int, 4>* remap = thread_remap4.data();
     int remap_size = original_instructions.size();
     assert(remap_size <= thread_remap4.size());
     assert(thread_interval4_vars.size() >= remap_size);
 
-    // Initialize remap arrays to -1
-    for(int i = 0; i < remap_size; i++) {
-        for(int j = 0; j < 4; j++) {
-            remap[i][j] = -1;
-        }
-    }
-    // Mark the final instruction as needed for all four intervals
+    memset(remap, -1, remap_size * 4 * sizeof(int));
+
+    // Mark the final instruction as needed 
     for(int j = 0; j < 4; j++) {
         remap[remap_size - 1][j] = 1;
     }
@@ -580,6 +577,6 @@ int main(int argc, char *argv[])
     }
 
     printf("Rendered %dx at %.6fms/frame\n", num_runs, render_time.count() / num_runs);
-    write_image(image, "cout.ppm");
+    write_image(image, "out.ppm");
     return 0;
 }
