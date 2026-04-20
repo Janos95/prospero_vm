@@ -1,4 +1,5 @@
 #include "vm.h"
+#include "simd.h"
 
 #include <algorithm>
 #include <array>
@@ -21,11 +22,30 @@ struct Interval
 
 struct Interval4
 {
-    alignas(16) float lower[4];
-    alignas(16) float upper[4];
+    simd::v4f lower;
+    simd::v4f upper;
 };
 
-static std::vector<std::array<float, kBatchSize>> thread_batch_vars;
+#ifndef PROSPERO_BATCH_UNROLL
+#define PROSPERO_BATCH_UNROLL 2
+#endif
+
+#define PROSPERO_STRINGIFY_IMPL(x) #x
+#define PROSPERO_STRINGIFY(x) PROSPERO_STRINGIFY_IMPL(x)
+#define PROSPERO_PRAGMA(x) _Pragma(PROSPERO_STRINGIFY(x))
+#define PROSPERO_BATCH_UNROLL_PRAGMA PROSPERO_PRAGMA(clang loop unroll_count(PROSPERO_BATCH_UNROLL))
+
+constexpr int kBatchLanes = kBatchSize / simd::v4f::width;
+constexpr int kBatchVectorsPerRow = kTargetTileSize / simd::v4f::width;
+constexpr int kBatchUnroll = PROSPERO_BATCH_UNROLL;
+using Batch = std::array<simd::v4f, kBatchLanes>;
+
+static_assert(kBatchSize % simd::v4f::width == 0, "kBatchSize must be divisible by the SIMD width");
+static_assert(kTargetTileSize % simd::v4f::width == 0, "kTargetTileSize must be divisible by the SIMD width");
+static_assert(kBatchLanes % kBatchUnroll == 0, "kBatchLanes must be divisible by PROSPERO_BATCH_UNROLL");
+static_assert(kBatchUnroll > 0, "PROSPERO_BATCH_UNROLL must be positive");
+
+static std::vector<Batch> thread_batch_vars;
 static std::vector<Interval4> thread_interval4_vars;
 static std::vector<std::array<int, 4>> thread_remap4;
 #pragma omp threadprivate(thread_batch_vars, thread_interval4_vars, thread_remap4)
@@ -144,58 +164,130 @@ Instruction parse_instruction(const std::vector<std::string_view>& tokens)
     return inst;
 }
 
-std::array<float, kBatchSize> evaluate_batch(
+const Batch& evaluate_batch(
     const std::vector<Instruction>& instructions,
-    const std::array<float, kBatchSize>& x_coords,
-    const std::array<float, kBatchSize>& y_coords)
+    const Batch& x_coords,
+    const Batch& y_coords)
 {
-    std::array<float, kBatchSize>* batch_vars = thread_batch_vars.data();
-    const size_t num_instructions = instructions.size();
+    using simd::v4f;
 
-#define LOOP(expr) for (int j = 0; j < kBatchSize; ++j) { batch_vars[i][j] = (expr); }
+    Batch* batch_vars = thread_batch_vars.data();
+    const size_t num_instructions = instructions.size();
 
     for (size_t i = 0; i < num_instructions; ++i)
     {
         const Instruction& inst = instructions[i];
+        Batch& out = batch_vars[i];
         switch (inst.op)
         {
             case OpCode::VarX:
-                LOOP(x_coords[j]);
+                out = x_coords;
                 break;
             case OpCode::VarY:
-                LOOP(y_coords[j]);
+                out = y_coords;
                 break;
             case OpCode::Const:
-                LOOP(inst.constant);
+            {
+                const v4f value = v4f::splat(inst.constant);
+                out.fill(value);
                 break;
+            }
             case OpCode::Add:
-                LOOP(batch_vars[inst.input0][j] + batch_vars[inst.input1][j]);
+            {
+                const v4f* lhs = batch_vars[inst.input0].data();
+                const v4f* rhs = batch_vars[inst.input1].data();
+                v4f* dst = out.data();
+                PROSPERO_BATCH_UNROLL_PRAGMA
+                for (int j = 0; j < kBatchLanes; ++j)
+                {
+                    dst[j] = lhs[j] + rhs[j];
+                }
                 break;
+            }
             case OpCode::Sub:
-                LOOP(batch_vars[inst.input0][j] - batch_vars[inst.input1][j]);
+            {
+                const v4f* lhs = batch_vars[inst.input0].data();
+                const v4f* rhs = batch_vars[inst.input1].data();
+                v4f* dst = out.data();
+                PROSPERO_BATCH_UNROLL_PRAGMA
+                for (int j = 0; j < kBatchLanes; ++j)
+                {
+                    dst[j] = lhs[j] - rhs[j];
+                }
                 break;
+            }
             case OpCode::Mul:
-                LOOP(batch_vars[inst.input0][j] * batch_vars[inst.input1][j]);
+            {
+                const v4f* lhs = batch_vars[inst.input0].data();
+                const v4f* rhs = batch_vars[inst.input1].data();
+                v4f* dst = out.data();
+                PROSPERO_BATCH_UNROLL_PRAGMA
+                for (int j = 0; j < kBatchLanes; ++j)
+                {
+                    dst[j] = lhs[j] * rhs[j];
+                }
                 break;
+            }
             case OpCode::Max:
-                LOOP(fmax(batch_vars[inst.input0][j], batch_vars[inst.input1][j]));
+            {
+                const v4f* lhs = batch_vars[inst.input0].data();
+                const v4f* rhs = batch_vars[inst.input1].data();
+                v4f* dst = out.data();
+                PROSPERO_BATCH_UNROLL_PRAGMA
+                for (int j = 0; j < kBatchLanes; ++j)
+                {
+                    dst[j] = simd::max(lhs[j], rhs[j]);
+                }
                 break;
+            }
             case OpCode::Min:
-                LOOP(fmin(batch_vars[inst.input0][j], batch_vars[inst.input1][j]));
+            {
+                const v4f* lhs = batch_vars[inst.input0].data();
+                const v4f* rhs = batch_vars[inst.input1].data();
+                v4f* dst = out.data();
+                PROSPERO_BATCH_UNROLL_PRAGMA
+                for (int j = 0; j < kBatchLanes; ++j)
+                {
+                    dst[j] = simd::min(lhs[j], rhs[j]);
+                }
                 break;
+            }
             case OpCode::Neg:
-                LOOP(-batch_vars[inst.input0][j]);
+            {
+                const v4f* src = batch_vars[inst.input0].data();
+                v4f* dst = out.data();
+                PROSPERO_BATCH_UNROLL_PRAGMA
+                for (int j = 0; j < kBatchLanes; ++j)
+                {
+                    dst[j] = -src[j];
+                }
                 break;
+            }
             case OpCode::Square:
-                LOOP(batch_vars[inst.input0][j] * batch_vars[inst.input0][j]);
+            {
+                const v4f* src = batch_vars[inst.input0].data();
+                v4f* dst = out.data();
+                PROSPERO_BATCH_UNROLL_PRAGMA
+                for (int j = 0; j < kBatchLanes; ++j)
+                {
+                    const v4f value = src[j];
+                    dst[j] = value * value;
+                }
                 break;
+            }
             case OpCode::Sqrt:
-                LOOP(sqrt(batch_vars[inst.input0][j]));
+            {
+                const v4f* src = batch_vars[inst.input0].data();
+                v4f* dst = out.data();
+                PROSPERO_BATCH_UNROLL_PRAGMA
+                for (int j = 0; j < kBatchLanes; ++j)
+                {
+                    dst[j] = simd::sqrt(src[j]);
+                }
                 break;
+            }
         }
     }
-
-#undef LOOP
 
     return batch_vars[num_instructions - 1];
 }
@@ -207,9 +299,24 @@ float max4(float a, float b, float c, float d) { return max2(max2(a, b), max2(c,
 
 Interval4 evaluate_interval4(const std::vector<Instruction>& instructions, const Interval4& x, const Interval4& y)
 {
+    using simd::mask4;
+    using simd::v4f;
+
     Interval4* interval_vars = thread_interval4_vars.data();
     const size_t num_instructions = instructions.size();
     assert(thread_interval4_vars.size() >= num_instructions);
+    const v4f zero = v4f::splat(0.0f);
+    const v4f x_lower = x.lower;
+    const v4f x_upper = x.upper;
+    const v4f y_lower = y.lower;
+    const v4f y_upper = y.upper;
+
+    auto load_lower = [&](int idx) { return interval_vars[idx].lower; };
+    auto load_upper = [&](int idx) { return interval_vars[idx].upper; };
+    auto store_interval = [&](size_t idx, v4f lower, v4f upper)
+    {
+        interval_vars[idx] = {lower, upper};
+    };
 
     for (size_t i = 0; i < num_instructions; ++i)
     {
@@ -217,103 +324,79 @@ Interval4 evaluate_interval4(const std::vector<Instruction>& instructions, const
         switch (inst.op)
         {
             case OpCode::VarX:
-                for (int j = 0; j < 4; ++j)
-                {
-                    interval_vars[i].lower[j] = x.lower[j];
-                    interval_vars[i].upper[j] = x.upper[j];
-                }
+                store_interval(i, x_lower, x_upper);
                 break;
             case OpCode::VarY:
-                for (int j = 0; j < 4; ++j)
-                {
-                    interval_vars[i].lower[j] = y.lower[j];
-                    interval_vars[i].upper[j] = y.upper[j];
-                }
+                store_interval(i, y_lower, y_upper);
                 break;
             case OpCode::Const:
-                for (int j = 0; j < 4; ++j)
-                {
-                    interval_vars[i].lower[j] = inst.constant;
-                    interval_vars[i].upper[j] = inst.constant;
-                }
+            {
+                const v4f value = v4f::splat(inst.constant);
+                store_interval(i, value, value);
                 break;
+            }
             case OpCode::Add:
-                for (int j = 0; j < 4; ++j)
-                {
-                    interval_vars[i].lower[j] = interval_vars[inst.input0].lower[j] + interval_vars[inst.input1].lower[j];
-                    interval_vars[i].upper[j] = interval_vars[inst.input0].upper[j] + interval_vars[inst.input1].upper[j];
-                }
+                store_interval(i,
+                               load_lower(inst.input0) + load_lower(inst.input1),
+                               load_upper(inst.input0) + load_upper(inst.input1));
                 break;
             case OpCode::Sub:
-                for (int j = 0; j < 4; ++j)
-                {
-                    interval_vars[i].lower[j] = interval_vars[inst.input0].lower[j] - interval_vars[inst.input1].upper[j];
-                    interval_vars[i].upper[j] = interval_vars[inst.input0].upper[j] - interval_vars[inst.input1].lower[j];
-                }
+                store_interval(i,
+                               load_lower(inst.input0) - load_upper(inst.input1),
+                               load_upper(inst.input0) - load_lower(inst.input1));
                 break;
             case OpCode::Mul:
-                for (int j = 0; j < 4; ++j)
-                {
-                    float a = interval_vars[inst.input0].lower[j];
-                    float b = interval_vars[inst.input0].upper[j];
-                    float c = interval_vars[inst.input1].lower[j];
-                    float d = interval_vars[inst.input1].upper[j];
-                    float p1 = a * c;
-                    float p2 = a * d;
-                    float p3 = b * c;
-                    float p4 = b * d;
-                    interval_vars[i].lower[j] = min4(p1, p2, p3, p4);
-                    interval_vars[i].upper[j] = max4(p1, p2, p3, p4);
-                }
+            {
+                const v4f a = load_lower(inst.input0);
+                const v4f b = load_upper(inst.input0);
+                const v4f c = load_lower(inst.input1);
+                const v4f d = load_upper(inst.input1);
+                const v4f p1 = a * c;
+                const v4f p2 = a * d;
+                const v4f p3 = b * c;
+                const v4f p4 = b * d;
+                store_interval(i,
+                               simd::min(simd::min(p1, p2), simd::min(p3, p4)),
+                               simd::max(simd::max(p1, p2), simd::max(p3, p4)));
                 break;
+            }
             case OpCode::Max:
-                for (int j = 0; j < 4; ++j)
-                {
-                    interval_vars[i].lower[j] = max2(interval_vars[inst.input0].lower[j], interval_vars[inst.input1].lower[j]);
-                    interval_vars[i].upper[j] = max2(interval_vars[inst.input0].upper[j], interval_vars[inst.input1].upper[j]);
-                }
+                store_interval(i,
+                               simd::max(load_lower(inst.input0), load_lower(inst.input1)),
+                               simd::max(load_upper(inst.input0), load_upper(inst.input1)));
                 break;
             case OpCode::Min:
-                for (int j = 0; j < 4; ++j)
-                {
-                    interval_vars[i].lower[j] = min2(interval_vars[inst.input0].lower[j], interval_vars[inst.input1].lower[j]);
-                    interval_vars[i].upper[j] = min2(interval_vars[inst.input0].upper[j], interval_vars[inst.input1].upper[j]);
-                }
+                store_interval(i,
+                               simd::min(load_lower(inst.input0), load_lower(inst.input1)),
+                               simd::min(load_upper(inst.input0), load_upper(inst.input1)));
                 break;
             case OpCode::Neg:
-                for (int j = 0; j < 4; ++j)
-                {
-                    interval_vars[i].lower[j] = -interval_vars[inst.input0].upper[j];
-                    interval_vars[i].upper[j] = -interval_vars[inst.input0].lower[j];
-                }
+                store_interval(i, -load_upper(inst.input0), -load_lower(inst.input0));
                 break;
             case OpCode::Square:
-                for (int j = 0; j < 4; ++j)
-                {
-                    float a = interval_vars[inst.input0].lower[j];
-                    float b = interval_vars[inst.input0].upper[j];
-                    float sq_a = a * a;
-                    float sq_b = b * b;
-                    float min_val = min2(sq_a, sq_b);
-                    if (a <= 0.0f && b >= 0.0f)
-                    {
-                        min_val = 0.0f;
-                    }
-                    interval_vars[i].lower[j] = min_val;
-                    interval_vars[i].upper[j] = max2(sq_a, sq_b);
-                }
+            {
+                const v4f a = load_lower(inst.input0);
+                const v4f b = load_upper(inst.input0);
+                const v4f sq_a = a * a;
+                const v4f sq_b = b * b;
+                const mask4 crosses_zero = (a <= zero) & (b >= zero);
+                const v4f lower = simd::select(crosses_zero, zero, simd::min(sq_a, sq_b));
+                const v4f upper = simd::max(sq_a, sq_b);
+                store_interval(i, lower, upper);
                 break;
+            }
             case OpCode::Sqrt:
-                for (int j = 0; j < 4; ++j)
-                {
-                    float a = interval_vars[inst.input0].lower[j];
-                    float b = interval_vars[inst.input0].upper[j];
-                    float sqrt_a = sqrt(max2(0.0f, a));
-                    float sqrt_b = sqrt(max2(0.0f, b));
-                    interval_vars[i].lower[j] = (b < 0.0f) ? 0.0f : sqrt_a;
-                    interval_vars[i].upper[j] = (b < 0.0f) ? 0.0f : sqrt_b;
-                }
+            {
+                const v4f a = load_lower(inst.input0);
+                const v4f b = load_upper(inst.input0);
+                const v4f sqrt_a = simd::sqrt(simd::max(zero, a));
+                const v4f sqrt_b = simd::sqrt(simd::max(zero, b));
+                const mask4 invalid = b < zero;
+                store_interval(i,
+                               simd::select(invalid, zero, sqrt_a),
+                               simd::select(invalid, zero, sqrt_b));
                 break;
+            }
         }
     }
 
@@ -338,6 +421,20 @@ void prune_instructions4(const std::vector<Instruction>& original_instructions, 
     for (int i = remap_size - 1; i >= 0; --i)
     {
         const Instruction& inst = original_instructions[i];
+        float i0_lower[4];
+        float i0_upper[4];
+        float i1_lower[4];
+        float i1_upper[4];
+
+        if (inst.op == OpCode::Max || inst.op == OpCode::Min)
+        {
+            assert(inst.input0 < i && inst.input1 < i);
+            interval_vars[inst.input0].lower.store(i0_lower);
+            interval_vars[inst.input0].upper.store(i0_upper);
+            interval_vars[inst.input1].lower.store(i1_lower);
+            interval_vars[inst.input1].upper.store(i1_upper);
+        }
+
         for (int j = 0; j < 4; ++j)
         {
             if (remap[i][j] == -1)
@@ -347,18 +444,12 @@ void prune_instructions4(const std::vector<Instruction>& original_instructions, 
 
             if (inst.op == OpCode::Max)
             {
-                assert(inst.input0 < i && inst.input1 < i);
-                const float i0_lower = interval_vars[inst.input0].lower[j];
-                const float i0_upper = interval_vars[inst.input0].upper[j];
-                const float i1_lower = interval_vars[inst.input1].lower[j];
-                const float i1_upper = interval_vars[inst.input1].upper[j];
-
-                if (i0_lower >= i1_upper)
+                if (i0_lower[j] >= i1_upper[j])
                 {
                     remap[inst.input0][j] = 1;
                     remap[i][j] = 0;
                 }
-                else if (i1_lower >= i0_upper)
+                else if (i1_lower[j] >= i0_upper[j])
                 {
                     remap[inst.input1][j] = 1;
                     assert(remap[i][j] == 1);
@@ -372,18 +463,12 @@ void prune_instructions4(const std::vector<Instruction>& original_instructions, 
             }
             else if (inst.op == OpCode::Min)
             {
-                assert(inst.input0 < i && inst.input1 < i);
-                const float i0_lower = interval_vars[inst.input0].lower[j];
-                const float i0_upper = interval_vars[inst.input0].upper[j];
-                const float i1_lower = interval_vars[inst.input1].lower[j];
-                const float i1_upper = interval_vars[inst.input1].upper[j];
-
-                if (i0_upper <= i1_lower)
+                if (i0_upper[j] <= i1_lower[j])
                 {
                     remap[inst.input0][j] = 1;
                     remap[i][j] = 0;
                 }
-                else if (i1_upper <= i0_lower)
+                else if (i1_upper[j] <= i0_lower[j])
                 {
                     remap[inst.input1][j] = 1;
                     assert(remap[i][j] == 1);
@@ -484,31 +569,42 @@ void solve_region(const std::vector<Instruction>& instructions, std::vector<floa
     {
         float x_range = tile.ix.upper - tile.ix.lower;
         float y_range = tile.iy.upper - tile.iy.lower;
+        float x_step = x_range / tile.size;
 
-        std::array<float, kBatchSize> x_coords;
-        std::array<float, kBatchSize> y_coords;
+        Batch x_coords;
+        Batch y_coords;
 
         for (int dy = 0; dy < tile.size; ++dy)
         {
             float y = tile.iy.lower + (dy + 0.5f) * y_range / tile.size;
-            for (int dx = 0; dx < tile.size; ++dx)
+            for (int dx = 0; dx < tile.size; dx += simd::v4f::width)
             {
-                x_coords[dy * tile.size + dx] = tile.ix.lower + (dx + 0.5f) * x_range / tile.size;
-                y_coords[dy * tile.size + dx] = y;
+                const int batch_idx = dy * kBatchVectorsPerRow + dx / simd::v4f::width;
+                x_coords[batch_idx] = simd::v4f::make(
+                    tile.ix.lower + (dx + 0.5f) * x_step,
+                    tile.ix.lower + (dx + 1.5f) * x_step,
+                    tile.ix.lower + (dx + 2.5f) * x_step,
+                    tile.ix.lower + (dx + 3.5f) * x_step);
+                y_coords[batch_idx] = simd::v4f::splat(y);
             }
         }
 
-        const std::array<float, kBatchSize> values = evaluate_batch(instructions, x_coords, y_coords);
+        const Batch& values = evaluate_batch(instructions, x_coords, y_coords);
+        float lanes[simd::v4f::width];
 
         for (int dy = 0; dy < size; ++dy)
         {
-            for (int dx = 0; dx < size; ++dx)
+            for (int dx = 0; dx < size; dx += simd::v4f::width)
             {
-                int global_x = px + dx;
-                int global_y = kImageSize - 1 - (py + dy);
-                assert(global_x >= 0 && global_x < kImageSize && global_y >= 0 && global_y < kImageSize);
-                float v = values[dy * size + dx];
-                image[global_y * kImageSize + global_x] = (v < 0.0f) ? -1.0f : 0.0f;
+                const int batch_idx = dy * kBatchVectorsPerRow + dx / simd::v4f::width;
+                values[batch_idx].store(lanes);
+                for (int lane = 0; lane < simd::v4f::width; ++lane)
+                {
+                    int global_x = px + dx + lane;
+                    int global_y = kImageSize - 1 - (py + dy);
+                    assert(global_x >= 0 && global_x < kImageSize && global_y >= 0 && global_y < kImageSize);
+                    image[global_y * kImageSize + global_x] = (lanes[lane] < 0.0f) ? -1.0f : 0.0f;
+                }
             }
         }
 
@@ -528,23 +624,31 @@ void solve_region(const std::vector<Instruction>& instructions, std::vector<floa
 
     Tile tiles[4] = {ll, lr, ul, ur};
 
-    Interval4 ix4 = {{ll.ix.lower, lr.ix.lower, ul.ix.lower, ur.ix.lower}, {ll.ix.upper, lr.ix.upper, ul.ix.upper, ur.ix.upper}};
-    Interval4 iy4 = {{ll.iy.lower, lr.iy.lower, ul.iy.lower, ur.iy.lower}, {ll.iy.upper, lr.iy.upper, ul.iy.upper, ur.iy.upper}};
+    Interval4 ix4 = {
+        simd::v4f::make(ll.ix.lower, lr.ix.lower, ul.ix.lower, ur.ix.lower),
+        simd::v4f::make(ll.ix.upper, lr.ix.upper, ul.ix.upper, ur.ix.upper)
+    };
+    Interval4 iy4 = {
+        simd::v4f::make(ll.iy.lower, lr.iy.lower, ul.iy.lower, ur.iy.lower),
+        simd::v4f::make(ll.iy.upper, lr.iy.upper, ul.iy.upper, ur.iy.upper)
+    };
 
     Interval4 ir4 = evaluate_interval4(instructions, ix4, iy4);
     std::array<std::vector<Instruction>, 4> compacted_instructions;
     prune_instructions4(instructions, compacted_instructions);
+    float lower[4];
+    float upper[4];
+    ir4.lower.store(lower);
+    ir4.upper.store(upper);
 
     for (size_t i = 0; i < 4; ++i)
     {
-        float lower = ir4.lower[i];
-        float upper = ir4.upper[i];
-        if (upper < 0.0f)
+        if (upper[i] < 0.0f)
         {
             fill_region(image, tiles[i], -1.0f);
             continue;
         }
-        if (lower >= 0.0f)
+        if (lower[i] >= 0.0f)
         {
             continue;
         }
@@ -640,3 +744,7 @@ void render_image(const std::vector<Instruction>& instructions, std::vector<floa
 
     evaluate_recursive(instructions, image);
 }
+#undef PROSPERO_BATCH_UNROLL_PRAGMA
+#undef PROSPERO_PRAGMA
+#undef PROSPERO_STRINGIFY
+#undef PROSPERO_STRINGIFY_IMPL
