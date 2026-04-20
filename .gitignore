@@ -2,4 +2,6 @@
 .cache/
 vm
 cout.ppm
+out.ppm
+build-wasm-node/
 compile_commands.json
