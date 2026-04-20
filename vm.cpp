@@ -6,10 +6,12 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <string_view>
 #include <vector>
 
@@ -48,7 +50,53 @@ static_assert(kBatchUnroll > 0, "PROSPERO_BATCH_UNROLL must be positive");
 static std::vector<Batch> thread_batch_vars;
 static std::vector<Interval4> thread_interval4_vars;
 static std::vector<std::array<int, 4>> thread_remap4;
-#pragma omp threadprivate(thread_batch_vars, thread_interval4_vars, thread_remap4)
+static std::vector<uint8_t> thread_live_mask4;
+static std::vector<uint8_t> thread_emit_mask4;
+static std::vector<uint8_t> thread_use0_mask4;
+static std::vector<uint8_t> thread_is_scalar;
+static std::vector<float> thread_scalar_value;
+
+struct InstructionFrame
+{
+    std::array<std::vector<Instruction>, 4> compacted;
+};
+
+static std::deque<InstructionFrame> thread_instruction_frames;
+static int thread_instruction_frame_depth = 0;
+#pragma omp threadprivate(thread_batch_vars, thread_interval4_vars, thread_remap4, thread_live_mask4, thread_emit_mask4, thread_use0_mask4, thread_is_scalar, thread_scalar_value, thread_instruction_frames, thread_instruction_frame_depth)
+
+InstructionFrame& acquire_instruction_frame(std::size_t instruction_count)
+{
+    if (thread_instruction_frame_depth == static_cast<int>(thread_instruction_frames.size()))
+    {
+        thread_instruction_frames.emplace_back();
+    }
+
+    InstructionFrame& frame = thread_instruction_frames[thread_instruction_frame_depth++];
+    for (std::vector<Instruction>& instructions : frame.compacted)
+    {
+        instructions.clear();
+        if (instructions.capacity() < instruction_count)
+        {
+            instructions.reserve(instruction_count);
+        }
+    }
+    return frame;
+}
+
+void release_instruction_frame()
+{
+    assert(thread_instruction_frame_depth > 0);
+    --thread_instruction_frame_depth;
+}
+
+struct InstructionFrameGuard
+{
+    explicit InstructionFrameGuard(std::size_t instruction_count) : frame(acquire_instruction_frame(instruction_count)) {}
+    ~InstructionFrameGuard() { release_instruction_frame(); }
+
+    InstructionFrame& frame;
+};
 
 float parse_float(std::string_view sv)
 {
@@ -62,6 +110,11 @@ int parse_hex_var(std::string_view sv)
     char* endptr = nullptr;
     errno = 0;
     long value_long = std::strtol(hex_part.data(), &endptr, 16);
+    if (value_long < 0)
+    {
+        std::fprintf(stderr, "Register index out of range: %.*s\n", static_cast<int>(sv.size()), sv.data());
+        std::exit(1);
+    }
     return static_cast<int>(value_long);
 }
 
@@ -172,6 +225,8 @@ const Batch& evaluate_batch(
     using simd::v4f;
 
     Batch* batch_vars = thread_batch_vars.data();
+    uint8_t* is_scalar = thread_is_scalar.data();
+    float* scalar_value = thread_scalar_value.data();
     const size_t num_instructions = instructions.size();
 
     for (size_t i = 0; i < num_instructions; ++i)
@@ -182,78 +237,253 @@ const Batch& evaluate_batch(
         {
             case OpCode::VarX:
                 out = x_coords;
+                is_scalar[i] = 0;
                 break;
             case OpCode::VarY:
                 out = y_coords;
+                is_scalar[i] = 0;
                 break;
             case OpCode::Const:
             {
-                const v4f value = v4f::splat(inst.constant);
-                out.fill(value);
+                is_scalar[i] = 1;
+                scalar_value[i] = inst.constant;
                 break;
             }
             case OpCode::Add:
             {
-                const v4f* lhs = batch_vars[inst.input0].data();
-                const v4f* rhs = batch_vars[inst.input1].data();
-                v4f* dst = out.data();
-                PROSPERO_BATCH_UNROLL_PRAGMA
-                for (int j = 0; j < kBatchLanes; ++j)
+                const bool lhs_scalar = is_scalar[inst.input0] != 0;
+                const bool rhs_scalar = is_scalar[inst.input1] != 0;
+                if (lhs_scalar && rhs_scalar)
                 {
-                    dst[j] = lhs[j] + rhs[j];
+                    is_scalar[i] = 1;
+                    scalar_value[i] = scalar_value[inst.input0] + scalar_value[inst.input1];
+                    break;
+                }
+
+                is_scalar[i] = 0;
+                v4f* dst = out.data();
+                if (lhs_scalar)
+                {
+                    const v4f lhs = v4f::splat(scalar_value[inst.input0]);
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs + rhs[j];
+                    }
+                }
+                else if (rhs_scalar)
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f rhs = v4f::splat(scalar_value[inst.input1]);
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs[j] + rhs;
+                    }
+                }
+                else
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs[j] + rhs[j];
+                    }
                 }
                 break;
             }
             case OpCode::Sub:
             {
-                const v4f* lhs = batch_vars[inst.input0].data();
-                const v4f* rhs = batch_vars[inst.input1].data();
-                v4f* dst = out.data();
-                PROSPERO_BATCH_UNROLL_PRAGMA
-                for (int j = 0; j < kBatchLanes; ++j)
+                const bool lhs_scalar = is_scalar[inst.input0] != 0;
+                const bool rhs_scalar = is_scalar[inst.input1] != 0;
+                if (lhs_scalar && rhs_scalar)
                 {
-                    dst[j] = lhs[j] - rhs[j];
+                    is_scalar[i] = 1;
+                    scalar_value[i] = scalar_value[inst.input0] - scalar_value[inst.input1];
+                    break;
+                }
+
+                is_scalar[i] = 0;
+                v4f* dst = out.data();
+                if (lhs_scalar)
+                {
+                    const v4f lhs = v4f::splat(scalar_value[inst.input0]);
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs - rhs[j];
+                    }
+                }
+                else if (rhs_scalar)
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f rhs = v4f::splat(scalar_value[inst.input1]);
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs[j] - rhs;
+                    }
+                }
+                else
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs[j] - rhs[j];
+                    }
                 }
                 break;
             }
             case OpCode::Mul:
             {
-                const v4f* lhs = batch_vars[inst.input0].data();
-                const v4f* rhs = batch_vars[inst.input1].data();
-                v4f* dst = out.data();
-                PROSPERO_BATCH_UNROLL_PRAGMA
-                for (int j = 0; j < kBatchLanes; ++j)
+                const bool lhs_scalar = is_scalar[inst.input0] != 0;
+                const bool rhs_scalar = is_scalar[inst.input1] != 0;
+                if (lhs_scalar && rhs_scalar)
                 {
-                    dst[j] = lhs[j] * rhs[j];
+                    is_scalar[i] = 1;
+                    scalar_value[i] = scalar_value[inst.input0] * scalar_value[inst.input1];
+                    break;
+                }
+
+                is_scalar[i] = 0;
+                v4f* dst = out.data();
+                if (lhs_scalar)
+                {
+                    const v4f lhs = v4f::splat(scalar_value[inst.input0]);
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs * rhs[j];
+                    }
+                }
+                else if (rhs_scalar)
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f rhs = v4f::splat(scalar_value[inst.input1]);
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs[j] * rhs;
+                    }
+                }
+                else
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = lhs[j] * rhs[j];
+                    }
                 }
                 break;
             }
             case OpCode::Max:
             {
-                const v4f* lhs = batch_vars[inst.input0].data();
-                const v4f* rhs = batch_vars[inst.input1].data();
-                v4f* dst = out.data();
-                PROSPERO_BATCH_UNROLL_PRAGMA
-                for (int j = 0; j < kBatchLanes; ++j)
+                const bool lhs_scalar = is_scalar[inst.input0] != 0;
+                const bool rhs_scalar = is_scalar[inst.input1] != 0;
+                if (lhs_scalar && rhs_scalar)
                 {
-                    dst[j] = simd::max(lhs[j], rhs[j]);
+                    is_scalar[i] = 1;
+                    scalar_value[i] = std::fmax(scalar_value[inst.input0], scalar_value[inst.input1]);
+                    break;
+                }
+
+                is_scalar[i] = 0;
+                v4f* dst = out.data();
+                if (lhs_scalar)
+                {
+                    const v4f lhs = v4f::splat(scalar_value[inst.input0]);
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = simd::max(lhs, rhs[j]);
+                    }
+                }
+                else if (rhs_scalar)
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f rhs = v4f::splat(scalar_value[inst.input1]);
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = simd::max(lhs[j], rhs);
+                    }
+                }
+                else
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = simd::max(lhs[j], rhs[j]);
+                    }
                 }
                 break;
             }
             case OpCode::Min:
             {
-                const v4f* lhs = batch_vars[inst.input0].data();
-                const v4f* rhs = batch_vars[inst.input1].data();
-                v4f* dst = out.data();
-                PROSPERO_BATCH_UNROLL_PRAGMA
-                for (int j = 0; j < kBatchLanes; ++j)
+                const bool lhs_scalar = is_scalar[inst.input0] != 0;
+                const bool rhs_scalar = is_scalar[inst.input1] != 0;
+                if (lhs_scalar && rhs_scalar)
                 {
-                    dst[j] = simd::min(lhs[j], rhs[j]);
+                    is_scalar[i] = 1;
+                    scalar_value[i] = std::fmin(scalar_value[inst.input0], scalar_value[inst.input1]);
+                    break;
+                }
+
+                is_scalar[i] = 0;
+                v4f* dst = out.data();
+                if (lhs_scalar)
+                {
+                    const v4f lhs = v4f::splat(scalar_value[inst.input0]);
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = simd::min(lhs, rhs[j]);
+                    }
+                }
+                else if (rhs_scalar)
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f rhs = v4f::splat(scalar_value[inst.input1]);
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = simd::min(lhs[j], rhs);
+                    }
+                }
+                else
+                {
+                    const v4f* lhs = batch_vars[inst.input0].data();
+                    const v4f* rhs = batch_vars[inst.input1].data();
+                    PROSPERO_BATCH_UNROLL_PRAGMA
+                    for (int j = 0; j < kBatchLanes; ++j)
+                    {
+                        dst[j] = simd::min(lhs[j], rhs[j]);
+                    }
                 }
                 break;
             }
             case OpCode::Neg:
             {
+                if (is_scalar[inst.input0] != 0)
+                {
+                    is_scalar[i] = 1;
+                    scalar_value[i] = -scalar_value[inst.input0];
+                    break;
+                }
+
+                is_scalar[i] = 0;
                 const v4f* src = batch_vars[inst.input0].data();
                 v4f* dst = out.data();
                 PROSPERO_BATCH_UNROLL_PRAGMA
@@ -265,6 +495,15 @@ const Batch& evaluate_batch(
             }
             case OpCode::Square:
             {
+                if (is_scalar[inst.input0] != 0)
+                {
+                    is_scalar[i] = 1;
+                    const float value = scalar_value[inst.input0];
+                    scalar_value[i] = value * value;
+                    break;
+                }
+
+                is_scalar[i] = 0;
                 const v4f* src = batch_vars[inst.input0].data();
                 v4f* dst = out.data();
                 PROSPERO_BATCH_UNROLL_PRAGMA
@@ -277,6 +516,14 @@ const Batch& evaluate_batch(
             }
             case OpCode::Sqrt:
             {
+                if (is_scalar[inst.input0] != 0)
+                {
+                    is_scalar[i] = 1;
+                    scalar_value[i] = std::sqrt(scalar_value[inst.input0]);
+                    break;
+                }
+
+                is_scalar[i] = 0;
                 const v4f* src = batch_vars[inst.input0].data();
                 v4f* dst = out.data();
                 PROSPERO_BATCH_UNROLL_PRAGMA
@@ -403,119 +650,118 @@ Interval4 evaluate_interval4(const std::vector<Instruction>& instructions, const
     return interval_vars[num_instructions - 1];
 }
 
-void prune_instructions4(const std::vector<Instruction>& original_instructions, std::array<std::vector<Instruction>, 4>& compacted_instructions)
+void prune_instructions4(
+    const std::vector<Instruction>& original_instructions,
+    uint8_t root_live_mask,
+    std::array<std::vector<Instruction>, 4>& compacted_instructions)
 {
     Interval4* interval_vars = thread_interval4_vars.data();
     std::array<int, 4>* remap = thread_remap4.data();
-    int remap_size = static_cast<int>(original_instructions.size());
-    assert(remap_size <= static_cast<int>(thread_remap4.size()));
-    assert(thread_interval4_vars.size() >= static_cast<size_t>(remap_size));
+    uint8_t* live_mask = thread_live_mask4.data();
+    uint8_t* emit_mask = thread_emit_mask4.data();
+    uint8_t* use0_mask = thread_use0_mask4.data();
+    const int instruction_count = static_cast<int>(original_instructions.size());
+    assert(instruction_count > 0);
+    assert(instruction_count <= static_cast<int>(thread_remap4.size()));
+    assert(thread_interval4_vars.size() >= static_cast<size_t>(instruction_count));
+    assert(thread_live_mask4.size() >= static_cast<size_t>(instruction_count));
+    assert(thread_emit_mask4.size() >= static_cast<size_t>(instruction_count));
+    assert(thread_use0_mask4.size() >= static_cast<size_t>(instruction_count));
 
-    memset(remap, -1, remap_size * 4 * sizeof(int));
-
-    for (int j = 0; j < 4; ++j)
+    root_live_mask &= 0x0F;
+    if (root_live_mask == 0)
     {
-        remap[remap_size - 1][j] = 1;
+        return;
     }
 
-    for (int i = remap_size - 1; i >= 0; --i)
-    {
-        const Instruction& inst = original_instructions[i];
-        float i0_lower[4];
-        float i0_upper[4];
-        float i1_lower[4];
-        float i1_upper[4];
+    memset(live_mask, 0, static_cast<size_t>(instruction_count) * sizeof(*live_mask));
+    memset(emit_mask, 0, static_cast<size_t>(instruction_count) * sizeof(*emit_mask));
+    memset(use0_mask, 0, static_cast<size_t>(instruction_count) * sizeof(*use0_mask));
+    live_mask[instruction_count - 1] = root_live_mask;
 
-        if (inst.op == OpCode::Max || inst.op == OpCode::Min)
+    for (int i = instruction_count - 1; i >= 0; --i)
+    {
+        const uint8_t live = live_mask[i];
+        if (live == 0)
+        {
+            continue;
+        }
+
+        const Instruction& inst = original_instructions[i];
+
+        if (inst.op == OpCode::Max)
         {
             assert(inst.input0 < i && inst.input1 < i);
-            interval_vars[inst.input0].lower.store(i0_lower);
-            interval_vars[inst.input0].upper.store(i0_upper);
-            interval_vars[inst.input1].lower.store(i1_lower);
-            interval_vars[inst.input1].upper.store(i1_upper);
+            const uint8_t choose0 = static_cast<uint8_t>(simd::mask_bits(interval_vars[inst.input0].lower >= interval_vars[inst.input1].upper) & live);
+            const uint8_t choose1 = static_cast<uint8_t>(simd::mask_bits(interval_vars[inst.input1].lower >= interval_vars[inst.input0].upper) & (live & ~choose0));
+            const uint8_t keep = static_cast<uint8_t>(live & ~(choose0 | choose1));
+            use0_mask[i] = choose0;
+            emit_mask[i] = keep;
+            live_mask[inst.input0] |= static_cast<uint8_t>(choose0 | keep);
+            live_mask[inst.input1] |= static_cast<uint8_t>(choose1 | keep);
         }
+        else if (inst.op == OpCode::Min)
+        {
+            assert(inst.input0 < i && inst.input1 < i);
+            const uint8_t choose0 = static_cast<uint8_t>(simd::mask_bits(interval_vars[inst.input1].lower >= interval_vars[inst.input0].upper) & live);
+            const uint8_t choose1 = static_cast<uint8_t>(simd::mask_bits(interval_vars[inst.input0].lower >= interval_vars[inst.input1].upper) & (live & ~choose0));
+            const uint8_t keep = static_cast<uint8_t>(live & ~(choose0 | choose1));
+            use0_mask[i] = choose0;
+            emit_mask[i] = keep;
+            live_mask[inst.input0] |= static_cast<uint8_t>(choose0 | keep);
+            live_mask[inst.input1] |= static_cast<uint8_t>(choose1 | keep);
+        }
+        else
+        {
+            emit_mask[i] = live;
+            if (inst.input0 != -1)
+            {
+                live_mask[inst.input0] |= live;
+            }
+            if (inst.input1 != -1)
+            {
+                live_mask[inst.input1] |= live;
+            }
+        }
+    }
 
+    int emit_count[4] = {0, 0, 0, 0};
+    for (int i = 0; i < instruction_count; ++i)
+    {
+        const uint8_t emitted = emit_mask[i];
         for (int j = 0; j < 4; ++j)
         {
-            if (remap[i][j] == -1)
-            {
-                continue;
-            }
-
-            if (inst.op == OpCode::Max)
-            {
-                if (i0_lower[j] >= i1_upper[j])
-                {
-                    remap[inst.input0][j] = 1;
-                    remap[i][j] = 0;
-                }
-                else if (i1_lower[j] >= i0_upper[j])
-                {
-                    remap[inst.input1][j] = 1;
-                    assert(remap[i][j] == 1);
-                }
-                else
-                {
-                    remap[inst.input0][j] = 1;
-                    remap[inst.input1][j] = 1;
-                    remap[i][j] = 2;
-                }
-            }
-            else if (inst.op == OpCode::Min)
-            {
-                if (i0_upper[j] <= i1_lower[j])
-                {
-                    remap[inst.input0][j] = 1;
-                    remap[i][j] = 0;
-                }
-                else if (i1_upper[j] <= i0_lower[j])
-                {
-                    remap[inst.input1][j] = 1;
-                    assert(remap[i][j] == 1);
-                }
-                else
-                {
-                    remap[inst.input0][j] = 1;
-                    remap[inst.input1][j] = 1;
-                    remap[i][j] = 2;
-                }
-            }
-            else
-            {
-                if (inst.input0 != -1)
-                {
-                    remap[inst.input0][j] = 1;
-                }
-                if (inst.input1 != -1)
-                {
-                    remap[inst.input1][j] = 1;
-                }
-            }
+            emit_count[j] += (emitted >> j) & 1u;
         }
     }
 
     for (int j = 0; j < 4; ++j)
     {
-        compacted_instructions[j].reserve(original_instructions.size());
+        compacted_instructions[j].reserve(static_cast<size_t>(emit_count[j]));
     }
 
-    for (int i = 0; i < remap_size; ++i)
+    for (int i = 0; i < instruction_count; ++i)
     {
-        for (int j = 0; j < 4; ++j)
+        const uint8_t live = live_mask[i];
+        if (live == 0)
         {
-            Instruction inst = original_instructions[i];
-            if (remap[i][j] == -1)
-            {
-                continue;
-            }
+            continue;
+        }
 
-            if (inst.op == OpCode::Max || inst.op == OpCode::Min)
+        const uint8_t emitted = emit_mask[i];
+        const uint8_t use0 = use0_mask[i];
+        uint8_t active_lanes = live;
+        while (active_lanes != 0)
+        {
+            const int j = __builtin_ctz(active_lanes);
+            const uint8_t bit = static_cast<uint8_t>(1u << j);
+            active_lanes &= static_cast<uint8_t>(active_lanes - 1);
+
+            Instruction inst = original_instructions[i];
+            if ((emitted & bit) == 0)
             {
-                if (remap[i][j] != 2)
-                {
-                    remap[i][j] = remap[i][j] == 0 ? remap[inst.input0][j] : remap[inst.input1][j];
-                    continue;
-                }
+                remap[i][j] = (use0 & bit) ? remap[inst.input0][j] : remap[inst.input1][j];
+                continue;
             }
 
             if (inst.input0 != -1)
@@ -538,26 +784,67 @@ struct Tile
     Interval ix, iy;
 };
 
-void fill_region(std::vector<float>& image, Tile tile, float value)
+void fill_region(std::vector<std::uint8_t>& image, Tile tile, std::uint8_t value)
 {
     int px = tile.px;
     int py = tile.py;
     int size = tile.size;
     for (int j = 0; j < size; ++j)
     {
-        for (int i = 0; i < size; ++i)
+        int global_y = kImageSize - 1 - (py + j);
+        assert(px >= 0 && px + size <= kImageSize && global_y >= 0 && global_y < kImageSize);
+        std::memset(image.data() + global_y * kImageSize + px, value, static_cast<std::size_t>(size));
+    }
+}
+
+
+void render_leaf_tile(const std::vector<Instruction>& instructions, std::vector<std::uint8_t>& image, Tile tile)
+{
+    int px = tile.px;
+    int py = tile.py;
+    int size = tile.size;
+    float x_range = tile.ix.upper - tile.ix.lower;
+    float y_range = tile.iy.upper - tile.iy.lower;
+    float x_step = x_range / tile.size;
+
+    Batch x_coords;
+    Batch y_coords;
+
+    for (int dy = 0; dy < tile.size; ++dy)
+    {
+        float y = tile.iy.lower + (dy + 0.5f) * y_range / tile.size;
+        for (int dx = 0; dx < tile.size; dx += simd::v4f::width)
         {
-            int global_x = px + i;
-            int global_y = kImageSize - 1 - (py + j);
-            if (global_x >= 0 && global_x < kImageSize && global_y >= 0 && global_y < kImageSize)
+            const int batch_idx = dy * kBatchVectorsPerRow + dx / simd::v4f::width;
+            x_coords[batch_idx] = simd::v4f::make(
+                tile.ix.lower + (dx + 0.5f) * x_step,
+                tile.ix.lower + (dx + 1.5f) * x_step,
+                tile.ix.lower + (dx + 2.5f) * x_step,
+                tile.ix.lower + (dx + 3.5f) * x_step);
+            y_coords[batch_idx] = simd::v4f::splat(y);
+        }
+    }
+
+    const Batch& values = evaluate_batch(instructions, x_coords, y_coords);
+    float lanes[simd::v4f::width];
+
+    for (int dy = 0; dy < size; ++dy)
+    {
+        for (int dx = 0; dx < size; dx += simd::v4f::width)
+        {
+            const int batch_idx = dy * kBatchVectorsPerRow + dx / simd::v4f::width;
+            values[batch_idx].store(lanes);
+            for (int lane = 0; lane < simd::v4f::width; ++lane)
             {
-                image[global_y * kImageSize + global_x] = value;
+                int global_x = px + dx + lane;
+                int global_y = kImageSize - 1 - (py + dy);
+                image[global_y * kImageSize + global_x] = (lanes[lane] < 0.0f) ? 255 : 0;
             }
         }
     }
 }
 
-void solve_region(const std::vector<Instruction>& instructions, std::vector<float>& image, Tile tile)
+void solve_region(const std::vector<Instruction>& instructions, std::vector<std::uint8_t>& image, Tile tile)
 {
     int px = tile.px;
     int py = tile.py;
@@ -567,50 +854,9 @@ void solve_region(const std::vector<Instruction>& instructions, std::vector<floa
 
     if (tile.size == kTargetTileSize)
     {
-        float x_range = tile.ix.upper - tile.ix.lower;
-        float y_range = tile.iy.upper - tile.iy.lower;
-        float x_step = x_range / tile.size;
-
-        Batch x_coords;
-        Batch y_coords;
-
-        for (int dy = 0; dy < tile.size; ++dy)
-        {
-            float y = tile.iy.lower + (dy + 0.5f) * y_range / tile.size;
-            for (int dx = 0; dx < tile.size; dx += simd::v4f::width)
-            {
-                const int batch_idx = dy * kBatchVectorsPerRow + dx / simd::v4f::width;
-                x_coords[batch_idx] = simd::v4f::make(
-                    tile.ix.lower + (dx + 0.5f) * x_step,
-                    tile.ix.lower + (dx + 1.5f) * x_step,
-                    tile.ix.lower + (dx + 2.5f) * x_step,
-                    tile.ix.lower + (dx + 3.5f) * x_step);
-                y_coords[batch_idx] = simd::v4f::splat(y);
-            }
-        }
-
-        const Batch& values = evaluate_batch(instructions, x_coords, y_coords);
-        float lanes[simd::v4f::width];
-
-        for (int dy = 0; dy < size; ++dy)
-        {
-            for (int dx = 0; dx < size; dx += simd::v4f::width)
-            {
-                const int batch_idx = dy * kBatchVectorsPerRow + dx / simd::v4f::width;
-                values[batch_idx].store(lanes);
-                for (int lane = 0; lane < simd::v4f::width; ++lane)
-                {
-                    int global_x = px + dx + lane;
-                    int global_y = kImageSize - 1 - (py + dy);
-                    assert(global_x >= 0 && global_x < kImageSize && global_y >= 0 && global_y < kImageSize);
-                    image[global_y * kImageSize + global_x] = (lanes[lane] < 0.0f) ? -1.0f : 0.0f;
-                }
-            }
-        }
-
+        render_leaf_tile(instructions, image, tile);
         return;
     }
-
     float mid_x = ix.lower + (ix.upper - ix.lower) / 2.0f;
     float mid_y = iy.lower + (iy.upper - iy.lower) / 2.0f;
 
@@ -634,28 +880,40 @@ void solve_region(const std::vector<Instruction>& instructions, std::vector<floa
     };
 
     Interval4 ir4 = evaluate_interval4(instructions, ix4, iy4);
-    std::array<std::vector<Instruction>, 4> compacted_instructions;
-    prune_instructions4(instructions, compacted_instructions);
     float lower[4];
     float upper[4];
     ir4.lower.store(lower);
     ir4.upper.store(upper);
+    uint8_t recurse_mask = 0;
 
     for (size_t i = 0; i < 4; ++i)
     {
         if (upper[i] < 0.0f)
         {
-            fill_region(image, tiles[i], -1.0f);
+            fill_region(image, tiles[i], 255);
             continue;
         }
         if (lower[i] >= 0.0f)
         {
             continue;
         }
+        recurse_mask |= static_cast<uint8_t>(1u << i);
+    }
 
+    if (recurse_mask == 0)
+    {
+        return;
+    }
+
+    InstructionFrameGuard frame_guard(instructions.size());
+    std::array<std::vector<Instruction>, 4>& compacted_instructions = frame_guard.frame.compacted;
+    prune_instructions4(instructions, recurse_mask, compacted_instructions);
+
+    for (uint8_t active = recurse_mask; active != 0; active &= static_cast<uint8_t>(active - 1))
+    {
+        const int i = __builtin_ctz(active);
         Tile& t = tiles[i];
         std::vector<Instruction>& intrcts = compacted_instructions[i];
-
         #pragma omp task default(shared) if(size > 64)
         solve_region(intrcts, image, t);
     }
@@ -663,7 +921,7 @@ void solve_region(const std::vector<Instruction>& instructions, std::vector<floa
     #pragma omp taskwait
 }
 
-void evaluate_recursive(const std::vector<Instruction>& instructions, std::vector<float>& image)
+void evaluate_recursive(const std::vector<Instruction>& instructions, std::vector<std::uint8_t>& image)
 {
     Tile initial_tile = {0, 0, kImageSize, {-1.0f, 1.0f}, {-1.0f, 1.0f}};
     #pragma omp parallel default(shared)
@@ -725,21 +983,26 @@ int prepare_thread_locals(std::size_t instruction_count)
         thread_batch_vars.resize(instruction_count);
         thread_interval4_vars.resize(instruction_count);
         thread_remap4.resize(instruction_count);
+        thread_live_mask4.resize(instruction_count);
+        thread_emit_mask4.resize(instruction_count);
+        thread_use0_mask4.resize(instruction_count);
+        thread_is_scalar.resize(instruction_count);
+        thread_scalar_value.resize(instruction_count);
         ++num_threads;
     }
 
     return num_threads.load();
 }
 
-void render_image(const std::vector<Instruction>& instructions, std::vector<float>& image)
+void render_image(const std::vector<Instruction>& instructions, std::vector<std::uint8_t>& image)
 {
     if (image.size() != static_cast<size_t>(kImageSize * kImageSize))
     {
-        image.assign(kImageSize * kImageSize, 0.0f);
+        image.assign(kImageSize * kImageSize, 0);
     }
     else
     {
-        std::fill(image.begin(), image.end(), 0.0f);
+        std::fill(image.begin(), image.end(), 0);
     }
 
     evaluate_recursive(instructions, image);

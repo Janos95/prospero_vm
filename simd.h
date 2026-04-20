@@ -99,6 +99,11 @@ inline mask4 operator>=(v4f a, v4f b)
     return mask4{wasm_f32x4_ge(a.value, b.value)};
 }
 
+inline int mask_bits(mask4 mask)
+{
+    return wasm_i32x4_bitmask(mask.value);
+}
+
 inline v4f select(mask4 mask, v4f on_true, v4f on_false)
 {
     return v4f{wasm_v128_bitselect(on_true.value, on_false.value, mask.value)};
@@ -213,6 +218,13 @@ inline mask4 operator>=(v4f a, v4f b)
     return mask4{vcgeq_f32(a.value, b.value)};
 }
 
+inline int mask_bits(mask4 mask)
+{
+    uint32_t lanes[4];
+    vst1q_u32(lanes, mask.value);
+    return (lanes[0] ? 1 : 0) | (lanes[1] ? 2 : 0) | (lanes[2] ? 4 : 0) | (lanes[3] ? 8 : 0);
+}
+
 inline v4f select(mask4 mask, v4f on_true, v4f on_false)
 {
     return v4f{vbslq_f32(mask.value, on_true.value, on_false.value)};
@@ -319,6 +331,11 @@ inline mask4 operator<=(v4f a, v4f b)
 inline mask4 operator>=(v4f a, v4f b)
 {
     return mask4{_mm_cmpge_ps(a.value, b.value)};
+}
+
+inline int mask_bits(mask4 mask)
+{
+    return _mm_movemask_ps(mask.value);
 }
 
 inline v4f select(mask4 mask, v4f on_true, v4f on_false)

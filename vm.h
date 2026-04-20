@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -20,4 +21,4 @@ struct Instruction
 
 std::vector<Instruction> parse_instructions(std::string_view text);
 int prepare_thread_locals(std::size_t instruction_count);
-void render_image(const std::vector<Instruction>& instructions, std::vector<float>& image);
+void render_image(const std::vector<Instruction>& instructions, std::vector<std::uint8_t>& image);

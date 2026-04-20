@@ -20,7 +20,7 @@ std::string read_file(const char* filename)
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
 
-void write_image(const std::vector<float>& image, const char* filename)
+void write_image(const std::vector<std::uint8_t>& image, const char* filename)
 {
     FILE* file = std::fopen(filename, "wb");
     if (!file)
@@ -30,12 +30,7 @@ void write_image(const std::vector<float>& image, const char* filename)
     }
 
     std::fprintf(file, "P5\n%d %d\n255\n", kImageSize, kImageSize);
-
-    for (int i = 0; i < kImageSize * kImageSize; ++i)
-    {
-        unsigned char pixel = (image[i] < 0) ? 255 : 0;
-        std::fwrite(&pixel, 1, 1, file);
-    }
+    std::fwrite(image.data(), 1, image.size(), file);
 
     std::fclose(file);
 }
@@ -56,7 +51,7 @@ int main(int argc, char* argv[])
     std::printf("Allocating tls for %d threads took %.2f ms\n", num_threads, duration_setup.count());
 
     auto start_alloc = std::chrono::high_resolution_clock::now();
-    std::vector<float> image(kImageSize * kImageSize, 0.0f);
+    std::vector<std::uint8_t> image(kImageSize * kImageSize, 0);
     auto end_alloc = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> duration_alloc = end_alloc - start_alloc;
     std::printf("Allocating image took %.2f ms\n", duration_alloc.count());
