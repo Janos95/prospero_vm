@@ -62,7 +62,13 @@ struct Interval4
 #define PROSPERO_STRINGIFY_IMPL(x) #x
 #define PROSPERO_STRINGIFY(x) PROSPERO_STRINGIFY_IMPL(x)
 #define PROSPERO_PRAGMA(x) _Pragma(PROSPERO_STRINGIFY(x))
+#if defined(__clang__)
 #define PROSPERO_BATCH_UNROLL_PRAGMA PROSPERO_PRAGMA(clang loop unroll_count(PROSPERO_BATCH_UNROLL))
+#elif defined(__GNUC__)
+#define PROSPERO_BATCH_UNROLL_PRAGMA PROSPERO_PRAGMA(GCC unroll PROSPERO_BATCH_UNROLL)
+#else
+#define PROSPERO_BATCH_UNROLL_PRAGMA
+#endif
 
 constexpr int kBatchLanes = kBatchSize / simd::v4f::width;
 constexpr int kBatchVectorsPerRow = kTargetTileSize / simd::v4f::width;
@@ -85,17 +91,27 @@ static_assert(kTargetTileSize % simd::v4f::width == 0, "kTargetTileSize must be 
 static_assert(kBatchLanes % kBatchUnroll == 0, "kBatchLanes must be divisible by PROSPERO_BATCH_UNROLL");
 static_assert(kBatchUnroll > 0, "PROSPERO_BATCH_UNROLL must be positive");
 
-static std::vector<Batch> thread_batch_vars;
-static std::vector<Interval4> thread_interval4_vars;
-static std::vector<std::array<int, 4>> thread_remap4;
-static std::vector<uint8_t> thread_live_mask4;
-static std::vector<uint8_t> thread_emit_mask4;
-static std::vector<uint8_t> thread_use0_mask4;
-static std::vector<uint8_t> thread_is_scalar;
-static std::vector<float> thread_scalar_value;
-static std::vector<uint8_t> thread_value_mode;
-static std::vector<XAxisBatch> thread_xonly_vars;
-static std::vector<YAxisBatch> thread_yonly_vars;
+// GCC rejects "omp threadprivate" on these class-type globals, so GCC builds use
+// C++ thread_local instead. Clang keeps the OpenMP pragma below.
+#if defined(__GNUC__) && !defined(__clang__)
+#define PROSPERO_USE_THREAD_LOCAL 1
+#define PROSPERO_THREAD_LOCAL thread_local
+#else
+#define PROSPERO_USE_THREAD_LOCAL 0
+#define PROSPERO_THREAD_LOCAL
+#endif
+
+static PROSPERO_THREAD_LOCAL std::vector<Batch> thread_batch_vars;
+static PROSPERO_THREAD_LOCAL std::vector<Interval4> thread_interval4_vars;
+static PROSPERO_THREAD_LOCAL std::vector<std::array<int, 4>> thread_remap4;
+static PROSPERO_THREAD_LOCAL std::vector<uint8_t> thread_live_mask4;
+static PROSPERO_THREAD_LOCAL std::vector<uint8_t> thread_emit_mask4;
+static PROSPERO_THREAD_LOCAL std::vector<uint8_t> thread_use0_mask4;
+static PROSPERO_THREAD_LOCAL std::vector<uint8_t> thread_is_scalar;
+static PROSPERO_THREAD_LOCAL std::vector<float> thread_scalar_value;
+static PROSPERO_THREAD_LOCAL std::vector<uint8_t> thread_value_mode;
+static PROSPERO_THREAD_LOCAL std::vector<XAxisBatch> thread_xonly_vars;
+static PROSPERO_THREAD_LOCAL std::vector<YAxisBatch> thread_yonly_vars;
 static std::array<Batch, kTilesPerAxis> g_leaf_x_coords;
 static std::array<Batch, kTilesPerAxis> g_leaf_y_coords;
 static std::array<XAxisBatch, kTilesPerAxis> g_leaf_x_axis;
@@ -211,9 +227,11 @@ struct InstructionFrame
     std::array<InstructionBuffer, 4> compacted;
 };
 
-static std::deque<InstructionFrame> thread_instruction_frames;
-static int thread_instruction_frame_depth = 0;
+static PROSPERO_THREAD_LOCAL std::deque<InstructionFrame> thread_instruction_frames;
+static PROSPERO_THREAD_LOCAL int thread_instruction_frame_depth = 0;
+#if !PROSPERO_USE_THREAD_LOCAL
 #pragma omp threadprivate(thread_batch_vars, thread_interval4_vars, thread_remap4, thread_live_mask4, thread_emit_mask4, thread_use0_mask4, thread_is_scalar, thread_scalar_value, thread_value_mode, thread_xonly_vars, thread_yonly_vars, thread_instruction_frames, thread_instruction_frame_depth)
+#endif
 
 InstructionFrame& acquire_instruction_frame(std::size_t instruction_count)
 {
@@ -1954,10 +1972,12 @@ std::vector<ExportedTileProgram> extract_tile_programs(const std::vector<Instruc
     const ProgramView program{instructions.data(), instructions.size()};
     extract_tile_programs_impl(program, initial_tile, programs);
 
+#ifndef NDEBUG
     for (const ExportedTileProgram& tile_program : programs)
     {
         assert(tile_program.is_constant || !tile_program.instructions.empty());
     }
+#endif
 
     return programs;
 }

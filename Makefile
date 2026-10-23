@@ -1,7 +1,15 @@
-CXX = clang++
 BATCH_UNROLL ?= 1
 OPTFLAGS ?= -O3 -DNDEBUG
-CXXFLAGS = $(OPTFLAGS) -Xclang -fopenmp -lomp -std=c++17 -L/opt/homebrew/opt/libomp/lib -DPROSPERO_AXIS_MODES=1 -DPROSPERO_BATCH_UNROLL=$(BATCH_UNROLL)
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+# Apple clang with Homebrew's libomp (brew install libomp)
+CXX = clang++
+OPENMP_FLAGS ?= -Xclang -fopenmp -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp
+else
+# GCC or clang with an OpenMP runtime installed
+OPENMP_FLAGS ?= -fopenmp
+endif
+CXXFLAGS = $(OPTFLAGS) $(OPENMP_FLAGS) -std=c++17 -DPROSPERO_AXIS_MODES=1 -DPROSPERO_BATCH_UNROLL=$(BATCH_UNROLL)
 TARGET = vm
 SRCS = main.cpp vm.cpp
 EMSDK ?= $(abspath ../emsdk)
