@@ -5,3 +5,7 @@ cout.ppm
 out.ppm
 build-wasm-node/
 compile_commands.json
+frontier
+out_frontier.pgm
+build-wasm-web/
+build-wasm-prof/

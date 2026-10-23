@@ -1,64 +1,68 @@
 # Prospero Virtual Machine
 
-A small (<600 loc), self-contained C++ implementation of Matt Keeter's [Prospero Challenge](https://www.mattkeeter.com/projects/prospero/). 
+Self-contained C++ renderers for Matt Keeter's [Prospero Challenge](https://www.mattkeeter.com/projects/prospero/): evaluate a program of about 7,900 math instructions over [-1, 1]², color each pixel by the sign of the result, and do it as fast as possible.
 
 <img src="out_4k.png" alt="4K Render" width="400">
 
+There are two renderers in this repo:
+
+- **`frontier`** (`frontier.cpp`): splits the expression into its ~700 separate shapes and renders each one inside a tight bounding box. This is the fastest version and the one running on [the blog post](https://janosmeny.com/blog/prospero-challenge/).
+- **`vm`** (`vm.cpp`): recursive tiling with interval arithmetic and expression pruning, multi-threaded with OpenMP.
+
+## Building
+
+```
+make check          # build frontier and verify it reproduces the published image
+make run-frontier   # benchmark the term-based renderer
+make run            # benchmark the tiling renderer (OpenMP)
+make run-single     # same, single-threaded
+make wasm-web       # browser build of frontier for the blog post (needs emsdk in ../emsdk)
+```
+
+On macOS the Makefile uses Apple clang with Homebrew's libomp (`brew install libomp`); elsewhere it uses `-fopenmp` with GCC or clang.
+
 ## Performance
 
-On a MacBook Air (M2), it renders the 1024x1024 image in about **2ms**. Running `make run` produces:
+Single-threaded frame times for the 1024×1024 image, all measured on the same machine (a 2-core cloud VM, so absolute numbers are slow; the ratios are what matter):
 
-```
-Loaded instructions in 1.67 ms
-Allocating tls for 8 threads took 2.97 ms
-Allocating image took 0.35 ms
-Rendered 500x at 1.96ms/frame
-```
+| Version | Renderer | ms / frame |
+| --- | --- | --- |
+| March 2025 | first tiling version | ~21 |
+| April 2026 | `vm`: tiling with pruning, axis modes, SIMD | ~11 |
+| April 2026 | `frontier`: per-shape rendering | ~6 |
 
-A 4096×4096 render takes about **4ms** for the expression evaluation. This was somewhat surprising to me, but 
-I think it can be explained by a combination of factors. For example for a 1024x1024 image the leaf tiles
-are too small to be contained inside of the shape, so we have to explicitly evaluate all leaf tiles. 
-Also the multi-threading seems to be slightly more effective at the larger size.
-Anyhow, the full breakdown for 4k is:
+For reference, the March 2025 version rendered the image in about 2 ms on a MacBook Air (M2) with 8 threads, and in about 8.7 ms single-threaded.
 
-```
-Loaded instructions in 1.66 ms
-Allocating tls for 8 threads took 2.85 ms
-Allocating image took 5.55 ms
-Rendered 500x at 4.30ms/frame
-```
+## The term-based renderer (`frontier`)
 
-The single threaded performance comes in at about **8.69ms** for an image of size 1024 and **20.98ms** for a 4k image.
+If you look at the expression long enough, you notice that it is basically a big union of about 700 fairly simple shapes (about 20 instructions each on average): it has the form min(e₁, …, e₇₀₀), and each shape is localized somewhere in the image. So instead of evaluating the whole expression everywhere, `frontier` renders each shape on its own:
 
-## Implementation Details
+1. **Split.** Walk down from the root through the nested `min` nodes. Every operand that is not itself a `min` is a term (666 for `prospero.vm`).
+2. **Compile each term.** Collect the term's sub-expression (at most 128 instructions) and renumber it. In one forward pass, fold constants, classify each node as constant / x-only / y-only / both, track affine nodes (`cx·x + cy·y + c0`) and nodes that are provably non-negative. Rewrite `sqrt(e) − k` as `e − k²` where that keeps the sign.
+3. **Bound it.** Push the condition "term ≤ 0" backwards through the term with interval arithmetic. That gives a range for each affine node, i.e. a pair of half-planes. Clip the square [-1, 1]² against them (Sutherland–Hodgman) to get a tight polygon and its pixel bounding box. Terms that are provably empty are skipped (87 of the 666).
+4. **Rasterize.** If the term has no `min` and nothing mixing x and y except `max`, the box is simply filled. Otherwise subdivide the box with interval arithmetic: drop rectangles that are outside, fill ones that are inside, and brute-force rectangles of at most 4,096 pixels. In the brute-force step, x-only nodes are evaluated once per span and y-only nodes once per row.
 
-The implementation uses several techniques to optimize expression evaluation. The core approach uses a divide and conquer strategy, recursively subdividing the image into smaller tiles. Interval arithmetic is used to efficiently discard tiles where all pixels are guaranteed to be either entirely positive or entirely negative.
+I originally dismissed this approach (see below) because extracting the terms was slow. The trick that makes it work is to never copy the full program: each frame walks only the `min` tree and each term's own nodes, with generation stamps instead of clearing per-instruction arrays.
 
-During the interval tracing, we record intermediate results which are later used to simplify the expression for subsequent evaluations.
+### Reconstruction note
 
-For small tiles, we use a simple batched evaluator that processes all pixels in a 16x16 tile in one pass. The interval arithmetic and 
-expression simplification are also performed in batches of four for better instruction parallelism.
+The source for this renderer was lost after it shipped on the blog. In October 2026 it was reconstructed from the WebAssembly build on the blog post. `frontier.cpp` reproduces that build **pixel for pixel** on `prospero.vm` (checksum 33,668,415, 666 terms), which `make check` verifies. Two notes:
 
-The divide and conquer process is multi-threaded using OpenMP.
+- Exact output needs `-ffp-contract=off`, and the code mirrors WebAssembly's `min`/`max` behavior for NaN and signed zero.
+- The blog also had a multi-threaded browser build. Its threading was not reconstructed; `frontier` is single-threaded. The `wasm-web` target builds a single-threaded drop-in for the page.
 
-### Failed Optimizations Attempts
+## The tiling renderer (`vm`)
 
-I experimented with several other optimization techniques that didn't provide significant performance improvements:
+The image is recursively subdivided into four tiles. Interval arithmetic on each tile discards tiles that are entirely inside or outside the shape; all four children are evaluated at once with 4-wide SIMD.
 
-I attempted to explicitly use SIMD instructions for both the batch evaluator and interval evaluator. However, this
-did not yield better performance. Apparently, the loops are already SIMD-friendly enough for the compiler to 
-automatically vectorize them.
+Each subdivision also simplifies the expression for the children. A reverse pass marks which instructions each child still needs, dropping the losing side of a `min` or `max` whenever the intervals decide it. A forward pass then compacts the surviving instructions into a smaller program per child.
 
-I also explored various approaches to reduce memory allocations and overall memory footpring. 
-They didn't provide measurable performance improvements though. I guess the system allocator 
-is smarter than what I could come up with :)
+16×16 leaf tiles are evaluated in batches. The evaluator tracks whether each value depends only on x, only on y, or on neither, and only does full per-pixel work where both are involved. There is a small portable SIMD layer (`simd.h`) for NEON, SSE and WebAssembly. Subdivision is multi-threaded with OpenMP tasks, and there is a threaded WebAssembly build (`make wasm-omp`).
 
-I also investigated a completely different approach: If you look at the expression long enough, you notice that it is 
-basically a big union of about 700 fairly simple expressions (on average about 20 instructions), i.e. it has 
-the form min(e1, ... , e_700). 
-If you visualize the expressions, they are all primitives localized in various regions of the image. 
-So it seems natural to parse out all these subexpressions, find a conservative bounding box for each of 
-them and then in parallel rasterize each expression into the final image.
-Unfortunately, it turns out that extracing the individual expressions from their joint instruction list is already
-fairly slow. At least my somewhat optimized implementation took more than a millisecond to create the 
-700 instruction lists.
+### Things that didn't help (March 2025)
+
+I attempted to explicitly use SIMD instructions for both the batch evaluator and interval evaluator. However, this did not yield better performance. Apparently, the loops are already SIMD-friendly enough for the compiler to automatically vectorize them.
+
+I also explored various approaches to reduce memory allocations and overall memory footprint. They didn't provide measurable performance improvements though. I guess the system allocator is smarter than what I could come up with :)
+
+I also tried parsing out the ~700 sub-expressions, finding a conservative bounding box for each and rasterizing them in parallel. My first implementation took more than a millisecond just to create the 700 instruction lists. A later version of this idea became `frontier`.
